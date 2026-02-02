@@ -1,0 +1,11 @@
+{
+  "node_id": 1,
+  "port": 6000,
+
+  "mysql": {
+    "host": "localhost",
+    "user": "root",
+    "password": "root",
+    "database": "ddb"
+  }
+}
