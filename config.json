@@ -1,6 +1,6 @@
 {
   "node_id": 1,
-  "port": 6000,
+  "port": 6001,
 
   "mysql": {
     "host": "localhost",

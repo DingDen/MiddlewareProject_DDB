@@ -3,7 +3,7 @@ import threading
 import json
 import time
 import hashlib
-import mysql.connector # lib externa
+import mysql.connector
 
 # ===================== CONFIG =====================
 with open("config.json") as f:
@@ -26,6 +26,7 @@ nodes = {}                 # node_id -> {id, ip, port}
 is_coordinator = False
 coordinator_id = None
 last_heartbeat = {}
+applied_log = set()        # checksum das queries aplicadas
 
 # ===================== IP AUTO =====================
 def get_local_ip():
@@ -57,29 +58,26 @@ def send_message(node, msg, wait=False):
 def broadcast_discovery():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
     msg = json.dumps({
         "type": "DISCOVERY",
         "id": NODE_ID,
         "ip": NODE_IP,
         "port": PORT
     })
-
     sock.sendto(msg.encode(), ('<broadcast>', DISCOVERY_PORT))
     sock.close()
 
 def listen_discovery():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', DISCOVERY_PORT))
-
     while True:
-        data, _ = sock.recvfrom(1024)
-        msg = json.loads(data.decode())
-
-        if msg["id"] != NODE_ID:
-            if msg["id"] not in nodes:
-                print(f"[DISCOVERY] Nó {msg['id']} em {msg['ip']}")
-            nodes[msg["id"]] = msg
+        try:
+            data, _ = sock.recvfrom(1024)
+            msg = json.loads(data.decode())
+            if msg["id"] != NODE_ID:
+                nodes[msg["id"]] = msg
+        except:
+            continue
 
 def discovery_loop():
     while True:
@@ -99,7 +97,6 @@ def heartbeat_sender():
 
 def heartbeat_monitor():
     global coordinator_id, is_coordinator
-
     while True:
         now = time.time()
         for nid in list(last_heartbeat.keys()):
@@ -107,7 +104,6 @@ def heartbeat_monitor():
                 print(f"[!] Nó {nid} caiu")
                 last_heartbeat.pop(nid)
                 nodes.pop(nid, None)
-
                 if nid == coordinator_id:
                     start_election()
         time.sleep(2)
@@ -115,19 +111,13 @@ def heartbeat_monitor():
 # ===================== ELECTION (BULLY) =====================
 def start_election():
     global is_coordinator, coordinator_id
-
     print("[ELECTION] Iniciando eleição")
     higher_exists = False
-
     for n in nodes.values():
         if n["id"] > NODE_ID:
-            resp = send_message(n, {
-                "type": "ELECTION",
-                "from": NODE_ID
-            }, wait=True)
+            resp = send_message(n, {"type": "ELECTION", "from": NODE_ID}, wait=True)
             if resp:
                 higher_exists = True
-
     if not higher_exists:
         is_coordinator = True
         coordinator_id = NODE_ID
@@ -135,13 +125,10 @@ def start_election():
 
 def announce_coordinator():
     for n in nodes.values():
-        send_message(n, {
-            "type": "COORDINATOR",
-            "id": NODE_ID
-        })
+        send_message(n, {"type": "COORDINATOR", "id": NODE_ID})
     print(f"[COORDINATOR] Sou o novo coordenador ({NODE_ID})")
 
-# ===================== QUERY =====================
+# ===================== QUERY / REPLICA =====================
 def execute_query(sql):
     cur = db.cursor()
     cur.execute(sql)
@@ -153,27 +140,18 @@ def replicate(sql):
     cs = checksum(sql)
     for n in nodes.values():
         if n["id"] != NODE_ID:
-            send_message(n, {
-                "type": "REPLICA",
-                "sql": sql,
-                "checksum": cs
-            })
+            send_message(n, {"type": "REPLICA", "sql": sql, "checksum": cs})
 
 # ===================== SERVER =====================
 def handle_client(conn):
     global is_coordinator, coordinator_id
-
     try:
         data = json.loads(conn.recv(4096).decode())
     except:
         return
 
     if data["type"] == "DISCOVERY":
-        conn.sendall(json.dumps({
-            "id": NODE_ID,
-            "ip": NODE_IP,
-            "port": PORT
-        }).encode())
+        conn.sendall(json.dumps({"id": NODE_ID, "ip": NODE_IP, "port": PORT}).encode())
         return
 
     if data["type"] == "HEARTBEAT":
@@ -192,30 +170,30 @@ def handle_client(conn):
         return
 
     if data["type"] == "REPLICA":
-        if checksum(data["sql"]) == data["checksum"]:
+        cs = data["checksum"]
+        if cs not in applied_log:
             execute_query(data["sql"])
             db.commit()
+            applied_log.add(cs)
         return
 
     if data["type"] == "CLIENT_QUERY":
         sql = data["sql"]
+        cs = checksum(sql)
         try:
             if is_coordinator and not sql.lower().startswith("select"):
+                # aplica local e replica
                 execute_query(sql)
-                replicate(sql)
                 db.commit()
-                conn.sendall(json.dumps({
-                    "result": "COMMIT",
-                    "node": NODE_ID
-                }).encode())
+                applied_log.add(cs)
+                replicate(sql)
+                conn.sendall(json.dumps({"result": "COMMIT", "node": NODE_ID}).encode())
             else:
                 res = execute_query(sql)
-                conn.sendall(json.dumps({
-                    "result": res,
-                    "node": NODE_ID
-                }).encode())
+                conn.sendall(json.dumps({"result": res, "node": NODE_ID}).encode())
         except:
             db.rollback()
+            conn.sendall(json.dumps({"result": "ROLLBACK"}).encode())
 
 # ===================== TCP SERVER =====================
 def server():
@@ -223,18 +201,13 @@ def server():
     s.bind((NODE_IP, PORT))
     s.listen()
     print(f"[START] Nó {NODE_ID} ativo em {NODE_IP}:{PORT}")
-
     while True:
         conn, _ = s.accept()
         threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
 
 # ===================== START =====================
 if __name__ == "__main__":
-    nodes[NODE_ID] = {
-        "id": NODE_ID,
-        "ip": NODE_IP,
-        "port": PORT
-    }
+    nodes[NODE_ID] = {"id": NODE_ID, "ip": NODE_IP, "port": PORT}
 
     threading.Thread(target=server, daemon=True).start()
     threading.Thread(target=listen_discovery, daemon=True).start()
@@ -246,6 +219,5 @@ if __name__ == "__main__":
     start_election()
 
     print("[✓] DDB iniciado com sucesso")
-
     while True:
         time.sleep(1)
